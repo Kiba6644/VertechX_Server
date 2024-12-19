@@ -5,6 +5,7 @@ import moviepy as mp
 from flask_socketio import SocketIO, emit
 import torchaudio
 import os
+import geopy.distance
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline, WhisperProcessor, WhisperForConditionalGeneration
 import requests
 
@@ -91,30 +92,88 @@ class otherfunc():
         translated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
         return translated_text
     
-        try:
-            url = "https://overpass-api.de/api/interpreter"
-            query = f"""
-            [out:json];
-            node["amenity"="hospital"](around:5000,{lat},{lon});
-            out;
-            """
-            response = requests.get(url, params={"data": query})
-            data = response.json()
-
-            hospitals = []
-            for element in data.get("elements", []):
-                hospitals.append({
-                    "name": element.get("tags", {}).get("name", "Unknown Hospital"),
-                    "latitude": element["lat"],
-                    "longitude": element["lon"],
-                    "capacity": element.get("tags", {}).get("capacity", "Unknown")
-                })
-
-            return hospitals
-
-        except Exception as e:
-            print(f"Error fetching hospitals: {e}")
+    def get_amenities_by_city(city_name, amenity_type):
+        base_url = "https://overpass-api.de/api/interpreter"
+        query = f"""
+        [out:json];
+        area[name="{city_name}"]->.searchArea;
+        (
+        node["amenity"="{amenity_type}"](area.searchArea);
+        way["amenity"="{amenity_type}"](area.searchArea);
+        relation["amenity"="{amenity_type}"](area.searchArea);
+        );
+        out body;
+        >;
+        out skel qt;
+        """
+        response = requests.get(base_url, params={"data": query})
+        
+        if response.status_code != 200:
+            print(f"Error: {response.status_code}")
             return []
+        
+        data = response.json()
+        facilities = []
+        
+        for element in data.get("elements", []):
+            name = element.get("tags", {}).get("name", "Unnamed")
+            address = element.get("tags", {}).get("addr:full", "No address")
+            lat = element.get("lat", None)
+            lon = element.get("lon", None)
+            sector_id = element.get("tags", {}).get("addr:suburb", "Unknown")
+            facilities.append({
+                "name": name, "address": address, "lat": lat, "lon": lon, "sector_id": sector_id
+            })
+        
+        return facilities
+    
+    def calculate_city_score(city_name):
+        hospitals = otherfunc.get_amenities_by_city(city_name, "hospital")
+        police_stations = otherfunc.get_amenities_by_city(city_name, "police")
+        fire_stations = otherfunc.get_amenities_by_city(city_name, "fire_station")
+        score = 0
+        score += len(hospitals) * 3 
+        score += len(police_stations) * 2 
+        score += len(fire_stations) * 1
+        
+        return {
+            "total_score": score,
+            "facilities": {
+                "hospitals": len(hospitals),
+                "police_stations": len(police_stations),
+                "fire_stations": len(fire_stations),
+            }
+        }
+    
+    def get_weakest_sector(city_name):
+        hospitals = otherfunc.get_amenities_by_city(city_name, "hospital")
+        police_stations = otherfunc.get_amenities_by_city(city_name, "police")
+        fire_stations = otherfunc.get_amenities_by_city(city_name, "fire_station")
+
+        all_facilities = hospitals + police_stations + fire_stations
+        sector_count = {}
+        for facility in all_facilities:
+            sector_id = facility.get("sector_id", None)
+            if not sector_id:
+                continue
+            
+            sector_count[sector_id] = sector_count.get(sector_id, 0) + 1
+        
+        if not sector_count:
+            return {"weakest_sector_name": "No data", "facility_count": 0}
+
+        weakest_sector_id = min(sector_count, key=sector_count.get)
+        weakest_count = sector_count[weakest_sector_id]
+        
+        facilities_in_weakest_sector = [facility for facility in all_facilities if facility.get("sector_id") == weakest_sector_id]
+        
+        sector_name = weakest_sector_id 
+        return {
+            "weakest_sector_id": weakest_sector_id,
+            "weakest_sector_name": sector_name, 
+            "facility_count": weakest_count,
+            "facilities": facilities_in_weakest_sector
+        }
 
 class getloc():
     def get_disaster_prone_category(city):
@@ -139,56 +198,41 @@ class getloc():
         except Exception as e:
             print(f"Error fetching data: {e}")
             return "general"
-
-    def get_nearby_shelters(lat, lon):
-        try:
-            url = "https://overpass-api.de/api/interpreter"
-            query = f"""
-            [out:json];
-            node["amenity"="shelter"](around:5000,{lat},{lon});
-            out;
-            """
-            response = requests.get(url, params={"data": query})
-            data = response.json()
-
-            shelters = []
-            for element in data.get("elements", []):
-                shelters.append({
-                    "name": element.get("tags", {}).get("name", "Unknown Shelter"),
-                    "latitude": element["lat"],
-                    "longitude": element["lon"],
-                    "capacity": element.get("tags", {}).get("capacity", "Unknown")
-                })
-            return shelters
-        except Exception as e:
-            print(f"Error fetching shelters: {e}")
-            return []
    
-    def get_nearby_hospitals(lat, lon):
-        try:
-            url = "https://overpass-api.de/api/interpreter"
-            query = f"""
-            [out:json];
-            node["amenity"="hospital"](around:5000,{lat},{lon});
-            out;
-            """
-            response = requests.get(url, params={"data": query})
-            data = response.json()
-
-            hospitals = []
-            for element in data.get("elements", []):
-                hospitals.append({
-                    "name": element.get("tags", {}).get("name", "Unknown Hospital"),
-                    "latitude": element["lat"],
-                    "longitude": element["lon"],
-                    "capacity": element.get("tags", {}).get("capacity", "Unknown")
-                })
-
-            return hospitals
-
-        except Exception as e:
-            print(f"Error fetching hospitals: {e}")
+    def get_ameni(lat, lon, radius=10000, max_results=20, type="hospital"):
+        base_url = "https://overpass-api.de/api/interpreter"
+        query = f"""
+        [out:json];
+        node["amenity"="{type}"](around:{radius},{lat},{lon});
+        out body;
+        """
+        
+        response = requests.get(base_url, params={"data": query})
+        
+        if response.status_code != 200:
+            print(f"Error: {response.status_code}")
             return []
+        
+        data = response.json()
+        hospitals = []
+        
+        for element in data.get("elements", []):
+            hospital_name = element.get("tags", {}).get("name", "Unnamed")
+            hospital_lat = element.get("lat")
+            hospital_lon = element.get("lon")
+            
+            if hospital_lat is None or hospital_lon is None:
+                continue
+            
+            distance = geopy.distance.distance((lat, lon), (hospital_lat, hospital_lon)).km
+            hospitals.append({
+                "name": hospital_name,
+                "lat": hospital_lat,
+                "lon": hospital_lon,
+                "distance": distance
+            })
+        hospitals_sorted = sorted(hospitals, key=lambda x: x['distance'])
+        return hospitals_sorted[:max_results]
 
 @app.route('/nearby-shelters', methods=['POST'])
 def nearby_shelters():
@@ -198,12 +242,16 @@ def nearby_shelters():
 
     lat = data['latitude']
     lon = data['longitude']
-    shelters = getloc.get_nearby_shelters(lat, lon)
 
+    shelter = getloc.get_ameni(lat, lon, type='shelter')
+    if not shelter:
+        return jsonify({"message": "No nearby shelters found"}), 404
+    
     return jsonify({
-        "latitude": lat,
-        "longitude": lon,
-        "shelters": shelters
+        "shelters": [
+            {"name": shelter["name"], "latitude": shelter["lat"], "longitude": shelter["lon"], "distance": shelter["distance"]}
+            for hospital in shelter
+        ]
     })
 
 @app.route('/first-aid-kit', methods=['POST'])
@@ -230,12 +278,16 @@ def nearby_hospitals():
 
     lat = data['latitude']
     lon = data['longitude']
-    hospitals = getloc.get_nearby_hospitals(lat, lon)
 
+    hospitals = getloc.get_ameni(lat, lon)
+    if not hospitals:
+        return jsonify({"message": "No nearby hospitals found"}), 404
+    
     return jsonify({
-        "latitude": lat,
-        "longitude": lon,
-        "hospitals": hospitals
+        "hospitals": [
+            {"name": hospital["name"], "latitude": hospital["lat"], "longitude": hospital["lon"], "distance": hospital["distance"]}
+            for hospital in hospitals
+        ]
     })
 
 @app.route('/video', methods=['POST'])
@@ -406,6 +458,25 @@ def broadca():
     msg = data.get('msg')
     emit('notification', data, broadcast=True)
 
+@app.route('/cityscore', methods=['POST'])
+def scorec():
+    data = request.get_json()
+    city_name = data.get('city')
+    
+    city_score_data = otherfunc.calculate_city_score(city_name)
+
+    result = {
+        "city_score": city_score_data['total_score'],
+        "facilities_count": city_score_data['facilities'],
+    }
+    
+    weakest_sector_data = otherfunc.get_weakest_sector(city_name)
+    result["weakest_sector"] = {
+        "weakest_sector_name": weakest_sector_data['weakest_sector_name'],
+        "facility_count": weakest_sector_data['facility_count'],
+        "facilities": weakest_sector_data['facilities']
+    }
+    return jsonify(result)
 
 if __name__ == "__main__":
     app.run(debug=True)
