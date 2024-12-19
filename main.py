@@ -1,13 +1,13 @@
-from flask import Flask, jsonify, request
-from flask_sqlalchemy import SQLAlchemy
-from libretranslatepy import LibreTranslateAPI
-import moviepy as mp
-from flask_socketio import SocketIO, emit
-import torchaudio
-import os
-import geopy.distance
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline, WhisperProcessor, WhisperForConditionalGeneration
+from libretranslatepy import LibreTranslateAPI
+from flask import Flask, jsonify, request
+from flask_socketio import SocketIO, emit
+from flask_sqlalchemy import SQLAlchemy
+import geopy.distance
+import moviepy as mp
+import torchaudio
 import requests
+import os
 
 
 lis = []
@@ -24,6 +24,7 @@ disaster_data = {
     "flood-prone": ["Water purification tablets", "Antiseptic wipes", "Adhesive bandages", "Tweezers", "Flashlight"],
     "general": ["Adhesive bandages", "Antibiotic ointment", "Scissors", "Thermometer", "Alcohol wipes"]
 }
+
 #Admin users
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -127,7 +128,7 @@ class otherfunc():
         
         return facilities
     
-    def calculate_city_score(city_name):
+    def calculate_score(city_name):
         hospitals = otherfunc.get_amenities_by_city(city_name, "hospital")
         police_stations = otherfunc.get_amenities_by_city(city_name, "police")
         fire_stations = otherfunc.get_amenities_by_city(city_name, "fire_station")
@@ -135,22 +136,8 @@ class otherfunc():
         score += len(hospitals) * 3 
         score += len(police_stations) * 2 
         score += len(fire_stations) * 1
-        
-        return {
-            "total_score": score,
-            "facilities": {
-                "hospitals": len(hospitals),
-                "police_stations": len(police_stations),
-                "fire_stations": len(fire_stations),
-            }
-        }
-    
-    def get_weakest_sector(city_name):
-        hospitals = otherfunc.get_amenities_by_city(city_name, "hospital")
-        police_stations = otherfunc.get_amenities_by_city(city_name, "police")
-        fire_stations = otherfunc.get_amenities_by_city(city_name, "fire_station")
-
         all_facilities = hospitals + police_stations + fire_stations
+
         sector_count = {}
         for facility in all_facilities:
             sector_id = facility.get("sector_id", None)
@@ -158,21 +145,30 @@ class otherfunc():
                 continue
             
             sector_count[sector_id] = sector_count.get(sector_id, 0) + 1
-        
-        if not sector_count:
-            return {"weakest_sector_name": "No data", "facility_count": 0}
 
-        weakest_sector_id = min(sector_count, key=sector_count.get)
-        weakest_count = sector_count[weakest_sector_id]
-        
-        facilities_in_weakest_sector = [facility for facility in all_facilities if facility.get("sector_id") == weakest_sector_id]
-        
-        sector_name = weakest_sector_id 
+        if not sector_count:
+            weakest_sector = {"weakest_sector_name": "No data", "facility_count": 0, "facilities": []}
+        else:
+            weakest_sector_id = min(sector_count, key=sector_count.get)
+            weakest_count = sector_count[weakest_sector_id]
+            facilities_in_weakest_sector = [facility for facility in all_facilities if facility.get("sector_id") == weakest_sector_id]
+            weakest_sector = {
+                "weakest_sector_id": weakest_sector_id,
+                "weakest_sector_name": weakest_sector_id,
+                "facility_count": weakest_count,
+                "facilities": facilities_in_weakest_sector
+            }
+
         return {
-            "weakest_sector_id": weakest_sector_id,
-            "weakest_sector_name": sector_name, 
-            "facility_count": weakest_count,
-            "facilities": facilities_in_weakest_sector
+            "city": city_name,
+            "total_score": score,
+            "facilities": {
+                "hospitals": len(hospitals),
+                "police_stations": len(police_stations),
+                "fire_stations": len(fire_stations),
+            },
+            "facilities_list": all_facilities[:100],
+            "weakest_sector": weakest_sector
         }
 
 class getloc():
@@ -248,10 +244,8 @@ def nearby_shelters():
         return jsonify({"message": "No nearby shelters found"}), 404
     
     return jsonify({
-        "shelters": [
             {"name": shelter["name"], "latitude": shelter["lat"], "longitude": shelter["lon"], "distance": shelter["distance"]}
             for hospital in shelter
-        ]
     })
 
 @app.route('/first-aid-kit', methods=['POST'])
@@ -284,16 +278,14 @@ def nearby_hospitals():
         return jsonify({"message": "No nearby hospitals found"}), 404
     
     return jsonify({
-        "hospitals": [
             {"name": hospital["name"], "latitude": hospital["lat"], "longitude": hospital["lon"], "distance": hospital["distance"]}
             for hospital in hospitals
-        ]
     })
+
 
 @app.route('/video', methods=['POST'])
 def transcribe_video():
     data = request.get_json()
-    name = data.get('name')
     lang = data.get('lang')
 
     video_path = "temp_video.mp4"
@@ -462,21 +454,8 @@ def broadca():
 def scorec():
     data = request.get_json()
     city_name = data.get('city')
-    
-    city_score_data = otherfunc.calculate_city_score(city_name)
-
-    result = {
-        "city_score": city_score_data['total_score'],
-        "facilities_count": city_score_data['facilities'],
-    }
-    
-    weakest_sector_data = otherfunc.get_weakest_sector(city_name)
-    result["weakest_sector"] = {
-        "weakest_sector_name": weakest_sector_data['weakest_sector_name'],
-        "facility_count": weakest_sector_data['facility_count'],
-        "facilities": weakest_sector_data['facilities']
-    }
-    return jsonify(result)
+    city_score_data = otherfunc.calculate_score(city_name)
+    return jsonify(city_score_data)
 
 if __name__ == "__main__":
     app.run(debug=True)
