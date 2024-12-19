@@ -2,26 +2,29 @@ from flask import Flask, jsonify, request
 from flask_sqlalchemy import SQLAlchemy
 from libretranslatepy import LibreTranslateAPI
 import moviepy as mp
+from flask_socketio import SocketIO, emit
 import torchaudio
 import os
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline, WhisperProcessor, WhisperForConditionalGeneration
 import requests
 
+
+lis = []
 app = Flask(__name__)
 lt = LibreTranslateAPI("https://libretranslate.de/")
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///users.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SECRET_KEY'] = 'dasd'
 db = SQLAlchemy(app)
-
+socketio = SocketIO(app, cors_allowed_origins="*")
 disaster_data = {
     "coastal": ["Waterproof bandages", "Burn cream", "Antibiotic ointment", "Gauze pads", "Emergency thermal blanket"],
     "earthquake-prone": ["Gloves", "Dust masks", "Adhesive bandages", "Pain relievers", "Whistle"],
     "flood-prone": ["Water purification tablets", "Antiseptic wipes", "Adhesive bandages", "Tweezers", "Flashlight"],
     "general": ["Adhesive bandages", "Antibiotic ointment", "Scissors", "Thermometer", "Alcohol wipes"]
 }
-
-class Admin_users(db.Model):
+#Admin users
+class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     password = db.Column(db.String(120), nullable=False)
     name = db.Column(db.String(100))
@@ -30,8 +33,18 @@ class Admin_users(db.Model):
     age = db.Column(db.Integer)
     gender = db.Column(db.Boolean)  
 
+class itemtracker(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    type = db.Column(db.String(20), nullable=False)
+    update = db.Column(db.String(200))  
+
 with app.app_context():
     db.create_all()
+
+@socketio.on('connect')
+def handle_connect():
+    print("Client connected")
+    emit('server_message', {'message': 'Welcome! You are connected to the notification server.'})
 
 class otherfunc():
     def download_video(video_url, save_path="temp_video.mp4"):
@@ -247,6 +260,152 @@ def transcribe_video():
     os.remove(audio_path)
     print(summary, translated_summary)
     return jsonify(summary, translated_summary)
+
+@app.route('/register', methods=['POST'])
+def register():
+    data = request.get_json()
+
+    if not data or not data.get('name') or not data.get('password'):
+        return jsonify({"message": "name and password are required"}), 400
+
+    password = data.get('password')
+    name = data.get('name')
+    email = data.get('email')
+    phone = data.get('phone')
+    age = data.get('age')
+    gender = data.get('gender')
+
+    existing_user = User.query.filter_by(name=name).first()
+    if existing_user:
+        return jsonify({"message": "Username already exists"}), 400
+    new_user = User(
+        password=password,
+        name=name,
+        email=email,
+        phone=phone,
+        age=age,
+        gender=gender,
+    )
+    db.session.add(new_user)
+    db.session.commit()
+
+    return jsonify({"message": "User registered successfully"}), 200
+
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.get_json()
+
+    if not data or not data.get('email') or not data.get('password'):
+        return jsonify({"message": "Username and password are required"}), 400
+
+    email = data.get('email')
+    password = data.get('password')
+
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        return jsonify({"message": "User not found"}), 404
+
+    if not user.password == password:
+        return jsonify({"message": "Invalid password"}), 401
+
+    return jsonify({"message": "Login successful", "name": user.name}), 200
+
+@app.route('/sos', methods=['POST'])
+def sos():
+    global lis
+    data = request.get_json()
+    lat = data['latitude']
+    lon = data['longitude']
+    lis.append({lat,lon})
+    emit('notification', f'A person requested for help at {lat,lon}!', broadcast=True)
+
+@app.route('/track', methods=['POST'])
+def track():
+    updates = itemtracker.query.all()
+    fresponse_list = [
+            {
+                "id": updates.id,
+                "type": updates.type,
+                "msg": updates.update,
+            }
+            for i in updates
+        ]
+    return itemtracker.query.all()
+
+app.route("/trackupdate", methods=['POST'])
+def updatetracker():
+    data = request.get_json()
+    type = data.get('type')
+    msg = data.get('msg')
+
+    new_update = itemtracker(
+        type=type,
+        update=msg,
+    )
+    db.session.add(new_update)
+    db.session.commit()
+
+    return jsonify({"message": "User registered successfully"}), 200
+
+@app.route('/get_disasters', methods=['GET'])
+def get_disasters():
+    try:
+        disasters = []
+        storm_url = f"https://api.openweathermap.org/data/2.5/onecall?lat=0&lon=0&exclude=hourly,daily&appid=7a5d287cea04cae8cf65b769d7dcab48"
+        storm_response = requests.get(storm_url)
+        if storm_response.status_code == 200:
+            storm_data = storm_response.json()
+            for alert in storm_data.get("alerts", []):
+                disasters.append({
+                    "disaster_type": "Storm",
+                    "name": alert.get("event"),
+                    "latitude": alert.get("lat"),
+                    "longitude": alert.get("lon"),
+                    "description": alert.get("description"),
+                    "severity": alert.get("severity")
+                })
+
+        earthquake_response = requests.get("https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&limit=5")
+        if earthquake_response.status_code == 200:
+            earthquake_data = earthquake_response.json()
+            for feature in earthquake_data.get("features", []):
+                earthquake_properties = feature.get("properties", {})
+                earthquake_geometry = feature.get("geometry", {})
+                magnitude = earthquake_properties.get("mag")
+                place = earthquake_properties.get("place")
+                latitude = earthquake_geometry.get("coordinates", [])[1]
+                longitude = earthquake_geometry.get("coordinates", [])[0]
+                disasters.append({
+                    "disaster_type": "Earthquake",
+                    "name": place,
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "magnitude": magnitude
+                })
+
+        wildfire_response = requests.get("https://firms.modaps.eosdis.nasa.gov/api/active_fire/v2")
+        if wildfire_response.status_code == 200:
+            wildfire_data = wildfire_response.json()
+            for fire in wildfire_data.get("activeFire", []):
+                disasters.append({
+                    "disaster_type": "Wildfire",
+                    "name": fire.get("name"),
+                    "latitude": fire.get("latitude"),
+                    "longitude": fire.get("longitude"),
+                    "intensity": fire.get("intensity")
+                })
+
+        return jsonify({"disasters": disasters}), 200
+
+    except requests.exceptions.RequestException as e:
+        return jsonify({"error": f"An error occurred: {str(e)}"}), 500
+
+@app.route('/broadcast', methods=['POST'])
+def broadca():
+    data = request.get_json()
+    msg = data.get('msg')
+    emit('notification', data, broadcast=True)
+
 
 if __name__ == "__main__":
     app.run(debug=True)
